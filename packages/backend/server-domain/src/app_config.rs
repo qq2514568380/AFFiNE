@@ -19,6 +19,11 @@ use crate::events::EventBusPublisher;
 ///
 /// Matching is prefix-aware: both exact matches and any subpath starting with
 /// `<secret_key>.` are treated as secret.
+///
+/// Note: `default_app_config_json` overlays registered non-secret fields from
+/// the file config onto the defaults. Any newly registered config descriptor
+/// that holds credentials or secrets MUST also be added to `SECRET_CONFIG_KEYS`
+/// so it is never echoed in the admin `appConfig` view.
 pub const SECRET_CONFIG_KEYS: &[&str] = &[
   "auth.session.signingKeys",
   "calendar.google",
@@ -235,7 +240,27 @@ pub struct RuntimeAppConfigBaseline {
 
 impl RuntimeAppConfigBaseline {
   pub fn lookup_file_config_value(&self, key: &str) -> Option<&Value> {
-    key.split('.').try_fold(&self.file_json, |v, seg| v.get(seg))
+    match key {
+      "storages.blob.storage" => return self.file_storage_config("blob"),
+      "storages.avatar.storage" => return self.file_storage_config("avatar"),
+      _ => {}
+    }
+    let (module, mut rest) = key.split_once('.')?;
+    let mut cur = self.file_json.get(module)?;
+    loop {
+      if let Some(v) = cur.get(rest) {
+        return Some(v);
+      }
+      let (head, tail) = rest.split_once('.')?;
+      cur = cur.get(head)?;
+      rest = tail;
+    }
+  }
+  pub fn file_storage_config(&self, name: &str) -> Option<&Value> {
+    let s = self.file_json.get("storages")?;
+    s.get(format!("{name}.storage"))
+      .or_else(|| s.get(name)?.get("storage"))
+      .filter(|v| !v.is_null())
   }
 }
 
@@ -288,6 +313,38 @@ pub struct AppConfigService {
   cache: Arc<RwLock<CachedAppConfig>>,
   generation: Arc<AtomicU64>,
   oidc_discovery_cache: Arc<RwLock<OidcDiscoveryCache>>,
+}
+
+async fn load_named_storage_cfg<'e, E>(
+  exec: E,
+  baseline: &RuntimeAppConfigBaseline,
+  name: &str,
+) -> Result<Value, DomainError>
+where
+  E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+  let prefix = format!("storages.{name}%");
+  let rows: Vec<(String, Value)> =
+    sqlx::query_as("SELECT id, value FROM app_configs WHERE id = 'storages' OR id LIKE $1 ORDER BY id ASC")
+      .bind(prefix)
+      .fetch_all(exec)
+      .await
+      .map_err(|e| DomainError::Internal(format!("load {name} storage app_config: {e}")))?;
+  let mut cfg = Value::Object(Map::new());
+  if let Some(raw) = baseline.file_storage_config(name) {
+    set_nested_path(&mut cfg, &format!("storages.{name}.storage"), raw.clone());
+  }
+  for (k, v) in rows {
+    set_nested_path(&mut cfg, &k, v);
+  }
+  Ok(cfg)
+}
+
+async fn load_blob_storage_cfg<'e, E>(exec: E, baseline: &RuntimeAppConfigBaseline) -> Result<Value, DomainError>
+where
+  E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+  load_named_storage_cfg(exec, baseline, "blob").await
 }
 
 impl AppConfigService {
@@ -369,6 +426,48 @@ impl AppConfigService {
     Ok((*snapshot).clone())
   }
 
+  /// Reads fresh effective `appConfig` from PostgreSQL without preemptively
+  /// invalidating the in-memory cache; updates the cached snapshot only if the
+  /// query succeeds and no newer invalidation occurred concurrently.
+  pub async fn refresh_effective_app_config(&self) -> Result<Value, DomainError> {
+    let gen_before = self.generation.load(Ordering::Acquire);
+    let snapshot = self.load_effective_app_config_uncached().await?;
+    self.store_snapshot_if_generation_matches(gen_before, &snapshot);
+    Ok((*snapshot).clone())
+  }
+
+  pub fn cache_generation(&self) -> u64 {
+    self.generation.load(Ordering::Acquire)
+  }
+
+  /// Internal backend-only lookup for a single `app_configs` key (including
+  /// secret keys such as `storages.blob.storage` or `telemetry.ga4.apiSecret`).
+  /// Never expose the returned value over GraphQL or HTTP responses.
+  pub async fn get_raw_config_value(&self, key: &str) -> Result<Option<Value>, DomainError> {
+    let mut conn = self
+      .db
+      .acquire_tiered(WorkloadTier::InteractiveRead)
+      .await
+      .map_err(|e| DomainError::Internal(format!("acquire app_configs raw read: {e}")))?;
+    let row: Option<Value> = sqlx::query_scalar("SELECT value FROM app_configs WHERE id = $1")
+      .bind(key)
+      .fetch_optional(&mut *conn)
+      .await
+      .map_err(|e| DomainError::Internal(format!("load raw app_config `{key}`: {e}")))?;
+    if row.is_some() {
+      return Ok(row);
+    }
+    let baseline = default_app_config_json(&self.baseline);
+    let mut cursor = &baseline;
+    for seg in key.split('.') {
+      let Some(next) = cursor.get(seg) else {
+        return Ok(None);
+      };
+      cursor = next;
+    }
+    Ok(Some(cursor.clone()))
+  }
+
   /// Reads `(client.versionControl.enabled, client.versionControl.requiredVersion)`
   /// directly from the cached `appConfig` snapshot without cloning the full JSON tree.
   pub async fn get_client_version_control(&self) -> Result<(bool, String), DomainError> {
@@ -395,21 +494,64 @@ impl AppConfigService {
     actor_user_id: Option<&str>,
     updates: &[AppConfigUpdate],
   ) -> Result<Value, DomainError> {
+    self
+      .update_app_config_with_blob_guard(actor_user_id, updates, false)
+      .await
+  }
+  pub async fn load_effective_blob_storage_config_uncached(&self) -> Result<Option<Value>, DomainError> {
+    let mut conn = self
+      .db
+      .acquire_tiered(WorkloadTier::InteractiveRead)
+      .await
+      .map_err(|e| DomainError::Internal(format!("acquire blob storage config read: {e}")))?;
+    let cfg = load_blob_storage_cfg(&mut *conn, &self.baseline).await?;
+    Ok(cfg.pointer("/storages/blob/storage").filter(|v| !v.is_null()).cloned())
+  }
+  pub async fn load_effective_avatar_storage_config_uncached(&self) -> Result<Option<Value>, DomainError> {
+    let mut conn = self
+      .db
+      .acquire_tiered(WorkloadTier::InteractiveRead)
+      .await
+      .map_err(|e| DomainError::Internal(format!("acquire avatar storage config read: {e}")))?;
+    let cfg = load_named_storage_cfg(&mut *conn, &self.baseline, "avatar").await?;
+    Ok(
+      cfg
+        .pointer("/storages/avatar/storage")
+        .filter(|v| !v.is_null())
+        .cloned(),
+    )
+  }
+  pub async fn update_app_config_with_blob_guard(
+    &self,
+    actor_user_id: Option<&str>,
+    updates: &[AppConfigUpdate],
+    guard_blob_switch: bool,
+  ) -> Result<Value, DomainError> {
     if updates.is_empty() {
       return self.get_effective_app_config().await;
     }
-
     let defaults = default_app_config_json(&self.baseline);
     let mut tx = self
       .db
       .begin_tiered(WorkloadTier::InteractiveWrite)
       .await
       .map_err(|e| DomainError::Internal(format!("begin app_configs update: {e}")))?;
+    if guard_blob_switch {
+      sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('storages.blob.storage:reload', 0))")
+        .execute(&mut **tx.tx_mut())
+        .await
+        .map_err(|e| DomainError::Internal(format!("lock blob storage reload: {e}")))?;
+    }
 
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('app-config-paths', 0))")
       .execute(&mut **tx.tx_mut())
       .await
       .map_err(|e| DomainError::Internal(format!("lock app-config-paths: {e}")))?;
+    let before_blob_cfg = if guard_blob_switch {
+      Some(load_blob_storage_cfg(&mut **tx.tx_mut(), &self.baseline).await?)
+    } else {
+      None
+    };
     let mut seen_keys: Vec<String> = Vec::with_capacity(updates.len());
     for update in updates {
       let key = update.key.trim();
@@ -490,6 +632,66 @@ impl AppConfigService {
       }
     }
 
+    if let Some(before_cfg) = before_blob_cfg {
+      let after_cfg = load_blob_storage_cfg(&mut **tx.tx_mut(), &self.baseline).await?;
+      let target_key = |v: Option<&Value>| -> Option<(String, String, String, String)> {
+        let obj = v?.as_object()?;
+        fn raw_s<'a>(o: Option<&'a Map<String, Value>>, k: &str) -> Option<&'a str> {
+          o?.get(k)?.as_str()
+        }
+        let s = |o: Option<&Map<String, Value>>, k: &str| raw_s(o, k).unwrap_or("").trim().to_owned();
+        let (prov, cfg) = (
+          s(Some(obj), "provider").to_ascii_lowercase(),
+          obj.get("config").and_then(Value::as_object),
+        );
+        if prov.is_empty() {
+          return None;
+        }
+        let bkt = raw_s(Some(obj), "bucket")
+          .or_else(|| raw_s(cfg, "bucket"))
+          .filter(|x| !x.is_empty())
+          .unwrap_or("blobs")
+          .to_owned();
+        let ep = match prov.as_str() {
+          "fs" | "local" | "assetpack" => {
+            let root = [s(cfg, "path"), s(cfg, "root")]
+              .into_iter()
+              .find(|x| !x.is_empty())
+              .unwrap_or_else(|| "~/.affine/storage".into());
+            match root.strip_prefix("~/") {
+              Some(rest) => std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(rest).to_string_lossy().into_owned())
+                .unwrap_or(root),
+              None => root,
+            }
+          }
+          "cloudflare-r2" | "r2" if s(cfg, "endpoint").is_empty() => {
+            let eu = if s(cfg, "jurisdiction") == "eu" { ".eu" } else { "" };
+            format!("https://{}{eu}.r2.cloudflarestorage.com", s(cfg, "accountId"))
+          }
+          _ => s(cfg, "endpoint"),
+        };
+        Some((prov, bkt, ep, s(cfg, "region")))
+      };
+      if target_key(before_cfg.pointer("/storages/blob/storage"))
+        != target_key(after_cfg.pointer("/storages/blob/storage"))
+      {
+        let active: bool = sqlx::query_scalar(
+          "SELECT EXISTS(SELECT 1 FROM blobs WHERE status = 'pending' AND deleted_at IS NULL \
+           AND upload_id IS NOT NULL AND reservation_expires_at > clock_timestamp())",
+        )
+        .fetch_one(&mut **tx.tx_mut())
+        .await
+        .map_err(|e| DomainError::Internal(format!("check active multipart uploads: {e}")))?;
+        if active {
+          let _ = tx.rollback().await;
+          return Err(DomainError::Conflict(
+            "cannot switch storage backend while multipart upload is active".into(),
+          ));
+        }
+      }
+    }
+
     tx.commit()
       .await
       .map_err(|e| DomainError::Internal(format!("commit app_configs update: {e}")))?;
@@ -506,9 +708,18 @@ impl AppConfigService {
     self.store_snapshot_if_generation_matches(gen_before, &snapshot);
     Ok((*snapshot).clone())
   }
+  pub fn file_metrics_port(&self) -> Option<u16> {
+    self
+      .baseline
+      .lookup_file_config_value("metrics.port")
+      .and_then(Value::as_u64)
+      .and_then(|p| u16::try_from(p).ok())
+  }
+
   /// Returns nested metadata `{ source, settable, configured? }` for every known
   /// configuration key without ever echoing secret values.
   pub async fn get_app_config_metadata(&self) -> Result<Value, DomainError> {
+    let schema_defaults = schema_default_app_config_json(&self.baseline);
     let baseline_defaults = default_app_config_json(&self.baseline);
     let mut conn = self
       .db
@@ -527,7 +738,7 @@ impl AppConfigService {
       db_map.insert(id, value);
     }
     let mut all_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    collect_leaf_paths(&baseline_defaults, "", &mut all_keys);
+    collect_leaf_paths(&schema_defaults, "", &mut all_keys);
     for &k in SECRET_CONFIG_KEYS {
       all_keys.insert(k.to_owned());
     }
@@ -619,7 +830,7 @@ impl AppConfigService {
   /// rejects environment-only (`indexer.*`, boot-only) keys, and redacts secret
   /// values and secret error hints.
   pub fn validate_app_config(&self, updates: &[(String, String, Option<Value>, bool)]) -> Vec<AppConfigValidationItem> {
-    let defaults = default_app_config_json(&self.baseline);
+    let defaults = schema_default_app_config_json(&self.baseline);
     let mut known_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     collect_leaf_paths(&defaults, "", &mut known_keys);
     for &k in SECRET_CONFIG_KEYS {
@@ -1191,7 +1402,7 @@ pub fn is_allowed_config_key(key: &str) -> bool {
   has_child && ALLOWED_CONFIG_ROOTS.contains(&root)
 }
 
-pub fn default_app_config_json(baseline: &RuntimeAppConfigBaseline) -> Value {
+fn schema_default_app_config_json(baseline: &RuntimeAppConfigBaseline) -> Value {
   json!({
     "auth": {
       "allowSignup": true,
@@ -1362,6 +1573,26 @@ pub fn default_app_config_json(baseline: &RuntimeAppConfigBaseline) -> Value {
       "allowedOrigin": ["localhost", "127.0.0.1"]
     }
   })
+}
+
+pub fn default_app_config_json(baseline: &RuntimeAppConfigBaseline) -> Value {
+  let mut tree = schema_default_app_config_json(baseline);
+  let mut registered = std::collections::BTreeSet::new();
+  collect_leaf_paths(&tree, "", &mut registered);
+  for key in registered {
+    if key.contains('.')
+      && !baseline.env_keys.contains(&key)
+      && !is_secret_config_key(&key)
+      && !matches!(
+        key.as_str(),
+        "storages.blob.storage" | "storages.avatar.storage" | "storages.comment-attachments.storage"
+      )
+      && let Some(val) = baseline.lookup_file_config_value(&key)
+    {
+      set_nested_path(&mut tree, &key, val.clone());
+    }
+  }
+  tree
 }
 
 fn set_nested_path(root: &mut Value, dotted_path: &str, value: Value) {

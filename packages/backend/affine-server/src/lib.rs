@@ -724,6 +724,7 @@ async fn build_server_with_bound_port(
     refresh_retention_secs: server_domain::auth::DEFAULT_REFRESH_RETENTION_SECS,
     smtp_password: cli.mailer_password.clone().unwrap_or_default(),
     app_config_baseline: app_config_baseline.clone(),
+    ..RuntimeConfig::default()
   };
 
   let origin_channel = format!("v2:{channel}");
@@ -832,23 +833,29 @@ async fn build_server_with_bound_port(
     doc_sharing.clone(),
     Arc::clone(&event_bus),
   );
-  let app_config = AppConfigService::new(db.clone(), app_config_baseline, Arc::clone(&event_bus));
   let blob_root = std::env::var_os("HOME")
     .map(PathBuf::from)
     .unwrap_or_else(std::env::temp_dir)
     .join(".affine/storage");
   let blob_root_str = blob_root.to_string_lossy();
-  let storage = LocalFsBlobStorage::new(&blob_root_str, "blobs")
-    .map_err(|e| ServerError::InvalidConfig(format!("invalid blob storage config: {e}")))?;
-  let avatars: Arc<dyn server_blob::BlobStorageBackend> = Arc::new(
-    LocalFsBlobStorage::new(&blob_root_str, "avatars")
-      .map_err(|e| ServerError::InvalidConfig(format!("invalid avatar storage config: {e}")))?,
-  );
-  let comment_attachments: Arc<dyn server_blob::BlobStorageBackend> = Arc::new(
-    LocalFsBlobStorage::new(&blob_root_str, "comment-attachments")
-      .map_err(|e| ServerError::InvalidConfig(format!("invalid comment-attachments storage config: {e}")))?,
-  );
-  let blobs = BlobService::new(db.clone(), Arc::new(storage), ext.quota_gate());
+  let boot_storage = |name: &str, bucket: &str| -> Result<Arc<dyn server_blob::BlobStorageBackend>, ServerError> {
+    let scope = if name == "avatar" { "avatar" } else { "blob" };
+    if let Some(raw) = app_config_baseline.file_storage_config(name)
+      && let Some(spec) = server_blob::StorageBackendSpec::from_app_config_json_scoped(raw, scope, bucket)?
+    {
+      return spec
+        .build()
+        .map_err(|e| ServerError::InvalidConfig(format!("invalid {name} storage config: {e}")));
+    }
+    Ok(Arc::new(LocalFsBlobStorage::new(&blob_root_str, bucket).map_err(
+      |e| ServerError::InvalidConfig(format!("invalid {name} storage config: {e}")),
+    )?))
+  };
+  let storage = boot_storage("blob", "blobs")?;
+  let avatars = boot_storage("avatar", "avatars")?;
+  let comment_attachments = boot_storage("comment-attachments", "comment-attachments")?;
+  let app_config = AppConfigService::new(db.clone(), app_config_baseline, Arc::clone(&event_bus));
+  let blobs = BlobService::new(db.clone(), storage, ext.quota_gate());
   if cli.search_enabled && cli.search_provider == "embedded" && role != ServerRole::Allinone {
     return Err(ServerError::InvalidConfig(
       "embedded search provider is in-process and only supported with --role allinone; use elasticsearch/manticoresearch or --search-enabled=false for split roles".to_owned(),
@@ -982,6 +989,11 @@ where
   let built = build_server_with_bound_port(&cli, ext, shutdown.clone(), Some(local_addr.port())).await?;
   if !cli.skip_schema_check {
     built.state.db.ensure_schema_ready().await?;
+    built
+      .state
+      .init_blob_storage_from_app_config()
+      .await
+      .map_err(|e| ServerError::InvalidConfig(format!("invalid blob storage app_config: {e}")))?;
     if matches!(
       built.role,
       ServerRole::Allinone | ServerRole::Front | ServerRole::Graphql
@@ -991,9 +1003,28 @@ where
     if matches!(built.role, ServerRole::Allinone | ServerRole::Worker) {
       built.state.search.initialize().await?;
     }
+  } else {
+    let _ = built.state.init_blob_storage_from_app_config().await;
   }
 
   before_serve(&built).await?;
+
+  if built.state.redis.is_some() {
+    let cfg_state = Arc::clone(&built.state);
+    built
+      .supervisor
+      .spawn(move |shutdown| async move {
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let stop_sub = Arc::clone(&stop);
+        tokio::select! {
+          () = shutdown.cancelled() => {
+            stop.notify_waiters();
+          }
+          () = cfg_state.run_blob_storage_config_subscriber(stop_sub) => {}
+        }
+      })
+      .await;
+  }
 
   if matches!(built.role, ServerRole::Allinone | ServerRole::Worker) {
     built.state.search.spawn_worker_loop(&built.supervisor).await;
@@ -1062,7 +1093,7 @@ where
     )
     .await;
 
-    let hk_db = built.state.db.clone();
+    let hk_state = Arc::clone(&built.state);
     server_worker::spawn_locked_periodic_task(
       &built.supervisor,
       built.session_mutex.clone(),
@@ -1071,20 +1102,23 @@ where
       Duration::from_secs(1800),
       300,
       move |lease_cancel| {
-        let db = hk_db.clone();
+        let state = Arc::clone(&hk_state);
         async move {
           if !lease_cancel.is_cancelled()
-            && let Err(err) = server_domain::histories::cleanup_expired_snapshot_histories(&db, 1_000).await
+            && let Err(err) = server_domain::histories::cleanup_expired_snapshot_histories(&state.db, 1_000).await
           {
             tracing::warn!(error = %err, "expired snapshot_histories cleanup failed");
           }
           if !lease_cancel.is_cancelled()
-            && let Err(err) = server_domain::histories::cleanup_expired_runtime_states(&db, 1_000).await
+            && let Err(err) = server_domain::histories::cleanup_expired_runtime_states(&state.db, 1_000).await
           {
             tracing::warn!(error = %err, "expired runtime_states cleanup failed");
           }
           if !lease_cancel.is_cancelled()
-            && let Err(err) = server_domain::histories::cleanup_expired_blob_reservations(&db, 1_000).await
+            && let Err(err) = state
+              .blobs
+              .cleanup_expired_reservations(1_000, &|| lease_cancel.is_cancelled())
+              .await
           {
             tracing::warn!(error = %err, "expired blob reservation cleanup failed");
           }
