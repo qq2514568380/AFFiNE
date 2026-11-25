@@ -439,7 +439,6 @@ impl AppConfigService {
   pub fn cache_generation(&self) -> u64 {
     self.generation.load(Ordering::Acquire)
   }
-
   /// Internal backend-only lookup for a single `app_configs` key (including
   /// secret keys such as `storages.blob.storage` or `telemetry.ga4.apiSecret`).
   /// Never expose the returned value over GraphQL or HTTP responses.
@@ -1511,7 +1510,12 @@ fn schema_default_app_config_json(baseline: &RuntimeAppConfigBaseline) -> Value 
       }
     },
     "metrics": {
-      "enabled": false
+      "enabled": baseline
+        .file_json
+        .pointer("/metrics/enabled")
+        .or_else(|| baseline.file_json.get("metrics.enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
     },
     "oauth": {},
     "payment": {
